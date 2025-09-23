@@ -22,24 +22,31 @@ jobs:
     - name: Install Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
-          gettext git libncurses-dev libssl-dev python3-distutils-extra python3-setuptools rsync \
-          unzip zlib1g-dev file wget python3 python3-pip zstd
+        sudo apt-get install -y build-essential clang flex bison g++ gawk \
+          gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
+          python3-distutils-extra python3-setuptools rsync unzip zlib1g-dev \
+          file wget zstd
 
-    - name: Download and Extract OpenWrt SDK
+    - name: Download and Setup SDK
       run: |
         wget -O $SDK_FILE $SDK_URL
         mkdir -p $SDK_DIR
         tar -I zstd -xf $SDK_FILE
-        
-    - name: Update Feeds
+        mv openwrt-sdk-* $SDK_DIR
+
+    - name: Setup Build Environment
       run: |
         cd $SDK_DIR
-        echo "src-git base https://git.openwrt.org/openwrt/openwrt.git^024e2a2" > feeds.conf
-        echo "src-git-full packages https://git.openwrt.org/feed/packages.git^591867a" >> feeds.conf
-        echo "src-git-full luci https://git.openwrt.org/project/luci.git^f75f6c2" >> feeds.conf
-        echo "src-git-full routing https://git.openwrt.org/feed/routing.git^2f7428f" >> feeds.conf
-        echo "src-git-full telephony https://git.openwrt.org/feed/telephony.git^858e1a6" >> feeds.conf
+        # Create feeds.conf
+        cat > feeds.conf <<EOF
+        src-git base https://git.openwrt.org/openwrt/openwrt.git
+        src-git packages https://git.openwrt.org/feed/packages.git
+        src-git luci https://git.openwrt.org/project/luci.git
+        src-git routing https://git.openwrt.org/feed/routing.git
+        src-git telephony https://git.openwrt.org/feed/telephony.git
+        EOF
+        
+        # Update feeds
         ./scripts/feeds update -a
         ./scripts/feeds install -a
 
@@ -52,7 +59,7 @@ jobs:
       run: |
         cd $SDK_DIR
         cat > .config <<'EOF'
-        CONFIG_ALL=y
+        CONFIG_ALL_NONSHARED=y
         CONFIG_PACKAGE_amneziawg=y
         CONFIG_PACKAGE_amneziawg-tools=y
         CONFIG_PACKAGE_kmod-amneziawg=y
@@ -65,14 +72,19 @@ jobs:
         make package/amneziawg/{clean,compile} V=s
         make package/amneziawg-tools/{clean,compile} V=s
 
+    - name: Package Artifacts
+      run: |
+        cd $SDK_DIR/bin/packages/*
+        find . -name "amneziawg*.ipk" -exec cp {} $GITHUB_WORKSPACE/ \;
+
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
         name: amneziawg-packages
-        path: ${{ env.SDK_DIR }}/bin/packages/*/base/amneziawg*.ipk
+        path: amneziawg*.ipk
         retention-days: 5
 
-    - name: Upload Build Logs
+    - name: Upload Build Logs on Failure
       if: failure()
       uses: actions/upload-artifact@v4
       with:
@@ -80,4 +92,4 @@ jobs:
         path: |
           ${{ env.SDK_DIR }}/logs/
           ${{ env.SDK_DIR }}/.config
-        retention-days: 5
+        retention-days: 1
