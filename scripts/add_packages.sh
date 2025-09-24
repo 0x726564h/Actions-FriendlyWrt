@@ -1,5 +1,48 @@
 #!/bin/bash
 
+# {{ Add amneziawg
+(cd friendlywrt/package && {
+    [ -d amneziawg-openwrt ] && rm -rf amneziawg-openwrt
+    git clone https://github.com/amnezia-vpn/amneziawg-openwrt.git --depth 1
+})
+cat >> configs/rockchip/01-nanopi <<EOL
+CONFIG_PACKAGE_kmod-amneziawg=y
+CONFIG_PACKAGE_luci-proto-amneziawg=y
+CONFIG_PACKAGE_amneziawg-tools=y
+EOL
+# }}
+
+# {{ Add passwall
+(cd friendlywrt/package && {
+    [ -d openwrt-passwall ] && rm -rf openwrt-passwall
+    git clone https://github.com/xiaorouji/openwrt-passwall.git --depth 1
+    [ -d openwrt-passwall-packages ] && rm -rf openwrt-passwall-packages
+    git clone https://github.com/xiaorouji/openwrt-passwall-packages.git --depth 1
+})
+cat >> configs/rockchip/01-nanopi <<EOL
+CONFIG_PACKAGE_luci-app-passwall=y
+CONFIG_PACKAGE_luci-i18n-passwall-zh-cn=y
+CONFIG_PACKAGE_chinadns-ng=y
+CONFIG_PACKAGE_dns2socks=y
+CONFIG_PACKAGE_geoview=y
+CONFIG_PACKAGE_hysteria=y
+CONFIG_PACKAGE_ipt2socks=y
+CONFIG_PACKAGE_microsocks=y
+CONFIG_PACKAGE_naiveproxy=y
+CONFIG_PACKAGE_shadow-tls=y
+CONFIG_PACKAGE_shadowsocks-libev=y
+CONFIG_PACKAGE_shadowsocksr-libev=y
+CONFIG_PACKAGE_simple-obfs=y
+CONFIG_PACKAGE_sing-box=y
+CONFIG_PACKAGE_tcping=y
+CONFIG_PACKAGE_trojan-plus=y
+CONFIG_PACKAGE_tuic-client=y
+CONFIG_PACKAGE_v2ray-plugin=y
+CONFIG_PACKAGE_xray-core=y
+CONFIG_PACKAGE_xray-plugin=y
+EOL
+# }}
+
 # {{ Add luci-app-diskman
 (cd friendlywrt && {
     mkdir -p package/luci-app-diskman
