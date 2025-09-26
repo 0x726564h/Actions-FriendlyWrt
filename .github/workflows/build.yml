@@ -242,13 +242,106 @@ jobs:
         cd project
         source .current_config.mk
         rootfs_filename="rootfs-friendlywrt-${{ matrix.VERSION }}.tgz"
-        tar cvzf ../artifact/${rootfs_filename} ${FRIENDLYWRT_SRC}/${FRIENDLYWRT_ROOTFS} \
-              ${FRIENDLYWRT_SRC}/${FRIENDLYWRT_PACKAGE_DIR}
+        
+        # Проверяем какие файлы и директории существуют
+        echo "=== Checking available files and directories ==="
+        echo "Current directory: $(pwd)"
+        echo "FRIENDLYWRT_SRC: ${FRIENDLYWRT_SRC}"
+        echo "FRIENDLYWRT_ROOTFS: ${FRIENDLYWRT_ROOTFS}" 
+        echo "FRIENDLYWRT_PACKAGE_DIR: ${FRIENDLYWRT_PACKAGE_DIR}"
+        
+        # Ищем фактические пути к собранным файлам
+        echo "=== Looking for actual build outputs ==="
+        find . -name "*.rootfs*" -type f 2>/dev/null | head -10
+        find . -name "packages" -type d 2>/dev/null | head -10  
+        find . -path "*/bin/targets/*" -name "*.tar.gz" 2>/dev/null | head -10
+        find . -path "*/bin/targets/*" -name "*.img.gz" 2>/dev/null | head -10
+        
+        # Попытаемся найти правильные пути
+        ACTUAL_ROOTFS=""
+        ACTUAL_PACKAGES=""
+        
+        # Поиск rootfs
+        if [ -n "${FRIENDLYWRT_SRC}" ] && [ -n "${FRIENDLYWRT_ROOTFS}" ]; then
+          if [ -d "${FRIENDLYWRT_SRC}/${FRIENDLYWRT_ROOTFS}" ]; then
+            ACTUAL_ROOTFS="${FRIENDLYWRT_SRC}/${FRIENDLYWRT_ROOTFS}"
+          fi
+        fi
+        
+        # Альтернативный поиск rootfs
+        if [ -z "$ACTUAL_ROOTFS" ]; then
+          ACTUAL_ROOTFS=$(find . -path "*/friendlywrt/bin/targets/*/armv8/*rootfs*" -type f | head -1)
+        fi
+        
+        # Поиск packages
+        if [ -n "${FRIENDLYWRT_SRC}" ] && [ -n "${FRIENDLYWRT_PACKAGE_DIR}" ]; then
+          if [ -d "${FRIENDLYWRT_SRC}/${FRIENDLYWRT_PACKAGE_DIR}" ]; then
+            ACTUAL_PACKAGES="${FRIENDLYWRT_SRC}/${FRIENDLYWRT_PACKAGE_DIR}"
+          fi
+        fi
+        
+        # Альтернативный поиск packages
+        if [ -z "$ACTUAL_PACKAGES" ]; then
+          ACTUAL_PACKAGES=$(find . -path "*/friendlywrt/bin/targets/*/armv8/packages" -type d | head -1)
+        fi
+        
+        echo "=== Found paths ==="
+        echo "ACTUAL_ROOTFS: $ACTUAL_ROOTFS"
+        echo "ACTUAL_PACKAGES: $ACTUAL_PACKAGES"
+        
+        # Создаем архив только из существующих файлов
+        TAR_ARGS=""
+        
+        if [ -n "$ACTUAL_ROOTFS" ] && [ -e "$ACTUAL_ROOTFS" ]; then
+          echo "Adding rootfs to archive: $ACTUAL_ROOTFS"
+          TAR_ARGS="$TAR_ARGS $ACTUAL_ROOTFS"
+        else
+          echo "Warning: No rootfs found, skipping"
+        fi
+        
+        if [ -n "$ACTUAL_PACKAGES" ] && [ -d "$ACTUAL_PACKAGES" ]; then
+          echo "Adding packages to archive: $ACTUAL_PACKAGES"
+          TAR_ARGS="$TAR_ARGS $ACTUAL_PACKAGES"
+        else
+          echo "Warning: No packages directory found, skipping"
+        fi
+        
+        # Также ищем другие полезные файлы
+        KERNEL_FILES=$(find . -path "*/friendlywrt/bin/targets/*/armv8" -name "*kernel*" -type f 2>/dev/null)
+        SYSUPGRADE_FILES=$(find . -path "*/friendlywrt/bin/targets/*/armv8" -name "*sysupgrade*" -type f 2>/dev/null)
+        
+        for file in $KERNEL_FILES $SYSUPGRADE_FILES; do
+          if [ -f "$file" ]; then
+            echo "Adding additional file: $file"
+            TAR_ARGS="$TAR_ARGS $file"
+          fi
+        done
+        
+        # Создаем архив
+        if [ -n "$TAR_ARGS" ]; then
+          echo "=== Creating archive with files: $TAR_ARGS ==="
+          tar czf ../artifact/${rootfs_filename} $TAR_ARGS
+          
+          # Проверяем размер созданного архива
+          if [ -f "../artifact/${rootfs_filename}" ]; then
+            archive_size=$(stat -f%z "../artifact/${rootfs_filename}" 2>/dev/null || stat -c%s "../artifact/${rootfs_filename}" 2>/dev/null)
+            echo "Archive created successfully, size: $archive_size bytes"
+          else
+            echo "Error: Archive was not created"
+            exit 1
+          fi
+        else
+          echo "Error: No files found to archive"
+          echo "=== Full directory listing for debugging ==="
+          find . -path "*/friendlywrt/bin*" -type f | head -20
+          exit 1
+        fi
+        
         echo "rootfs_filename=$rootfs_filename" >> $GITHUB_OUTPUT
 
     - name: Upload build logs (for debugging)
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v3
       with:
         name: build-logs
         path: |
@@ -257,6 +350,7 @@ jobs:
         retention-days: 7
 
     - name: Upload rootfs package
+      if: steps.create_rootfs_package.outcome == 'success'
       uses: svenstaro/upload-release-action@v2
       with:
         repo_token: ${{ secrets.GITHUB_TOKEN }}
@@ -264,3 +358,24 @@ jobs:
         asset_name: ${{ steps.create_rootfs_package.outputs.rootfs_filename }}
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
+
+    # Дополнительная загрузка отдельных файлов если архив не удался
+    - name: Upload individual build artifacts (fallback)
+      if: steps.create_rootfs_package.outcome == 'failure'
+      run: |
+        cd project
+        echo "=== Uploading individual files as fallback ==="
+        
+        # Ищем все созданные файлы образов
+        find . -path "*/friendlywrt/bin/targets/*/armv8" -type f \( -name "*.img.gz" -o -name "*.tar.gz" -o -name "*sysupgrade*" \) | while read file; do
+          if [ -f "$file" ]; then
+            filename=$(basename "$file")
+            echo "Found build artifact: $filename"
+            cp "$file" "../artifact/"
+            
+            # Загружаем каждый файл отдельно
+            gh release upload "${{ needs.prepare_release.outputs.release_tag }}" "../artifact/$filename" --clobber || echo "Failed to upload $filename"
+          fi
+        done
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
