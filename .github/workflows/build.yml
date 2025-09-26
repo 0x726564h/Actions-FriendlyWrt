@@ -257,7 +257,7 @@ jobs:
         retention-days: 7
 
     - name: Upload rootfs package
-      uses: svenstaro/upload-release-action@v4
+      uses: svenstaro/upload-release-action@v2
       with:
         repo_token: ${{ secrets.GITHUB_TOKEN }}
         file: ./artifact/${{ steps.create_rootfs_package.outputs.rootfs_filename }}
