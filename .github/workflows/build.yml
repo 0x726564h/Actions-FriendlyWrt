@@ -32,42 +32,38 @@ jobs:
     if: github.event.repository.owner.id == github.event.sender.id
     strategy:
       matrix:
-        VERSION: ['24.10']
-        SET: [non-docker]
+        VERSION: ['23.05', '24.10']
+        SET: [non-docker]  # Только non-docker
 
     steps:
     - name: Checkout
       uses: actions/checkout@main
 
     - name: Set up Go 1.24
-      uses: actions/setup-go@v5
+      uses: actions/cache@v3
       with:
         go-version: '1.24.x'
 
-    # РЕШЕНИЕ 1: Установка системного LLVM
-    - name: Install system LLVM
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y llvm-15-dev libllvm15 llvm-15 llvm-15-runtime
-        # Создаем симлинки для совместимости
-        sudo ln -sf /usr/bin/llvm-config-15 /usr/bin/llvm-config
-        echo "LLVM_SYS_150_PREFIX=/usr/lib/llvm-15" >> $GITHUB_ENV
-
-    # РЕШЕНИЕ 2: Кэширование Rust и LLVM сборки
-    - name: Cache Rust toolchain and LLVM
+    - name: Cache toolchain
       uses: actions/cache@v3
       with:
         path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          ~/.rustup
-          project/friendlywrt/build_dir/host/llvm*
-          project/friendlywrt/build_dir/host/rustc*
-          project/friendlywrt/staging_dir/host/bin/rustc
-          project/friendlywrt/staging_dir/host/lib/rustlib
-        key: rust-llvm-cache-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', '**/rust.mk') }}
+          ~/.cache/repo
+          project/toolchain
+          project/friendlywrt/staging_dir
+        key: friendlywrt-toolchain-${{ matrix.VERSION }}-${{ hashFiles('**/Makefile', '**/*.mk') }}
         restore-keys: |
-          rust-llvm-cache-${{ runner.os }}-
+          friendlywrt-toolchain-${{ matrix.VERSION }}-
+          friendlywrt-toolchain-
+
+    - name: Cache downloads
+      uses: actions/cache@v3
+      with:
+        path: project/friendlywrt/dl
+        key: friendlywrt-dl-${{ matrix.VERSION }}-${{ hashFiles('project/friendlywrt/feeds.conf.default') }}
+        restore-keys: |
+          friendlywrt-dl-${{ matrix.VERSION }}-
+          friendlywrt-dl-
 
     - name: Initialization environment
       env:
@@ -91,7 +87,7 @@ jobs:
 
     - name: Download source
       run: |
-        mkdir project
+        mkdir -p project
         cd project
         repo init --depth=1 -u https://github.com/friendlyarm/friendlywrt_manifests -b master-v${{ matrix.VERSION }} \
                 -m rk3399.xml --repo-url=https://github.com/friendlyarm/repo  --no-clone-bundle
@@ -109,69 +105,6 @@ jobs:
         cd project
         source ../scripts/add_packages.sh
         source ../scripts/custome_config.sh
-
-    # РЕШЕНИЕ 3: Комбинированный подход для исправления Rust
-    - name: Fix Rust compilation issues (Multi-approach)
-      run: |
-        cd project/friendlywrt
-
-        # Подход 1: Обновляем версию Rust в feeds до более новой
-        if [ -f feeds/packages/lang/rust/Makefile ]; then
-          # Попытаемся найти более новую стабильную версию Rust
-          sed -i 's/PKG_VERSION:=1.85.0/PKG_VERSION:=1.82.0/g' feeds/packages/lang/rust/Makefile 2>/dev/null || true
-          sed -i 's/rust-1.85.0-src/rust-1.82.0-src/g' feeds/packages/lang/rust/Makefile 2>/dev/null || true
-        fi
-
-        # Подход 2: Настройка для использования системного LLVM
-        export LLVM_CONFIG="/usr/bin/llvm-config-15"
-        export LIBCLANG_PATH="/usr/lib/llvm-15/lib"
-        
-        # Подход 3: Создание config.toml для Rust с правильными настройками
-        find . -path "*/rust-*/config.example.toml" | while read config_template; do
-          config_dir=$(dirname "$config_template")
-          cat > "$config_dir/config.toml" << EOF
-        [llvm]
-        download-ci-llvm = false
-        use-libcxx = false
-        link-shared = true
-        targets = "AArch64;ARM;X86"
-
-        [build]
-        extended = true
-        tools = ["cargo", "clippy", "rustfmt", "rust-analyzer"]
-        
-        [target.aarch64-unknown-linux-musl]
-        llvm-config = "/usr/bin/llvm-config-15"
-
-        [target.x86_64-unknown-linux-gnu]
-        llvm-config = "/usr/bin/llvm-config-15"
-        EOF
-        done
-
-        # Подход 4: Патч для принудительного использования системного LLVM
-        find . -name "rust.mk" -o -name "Makefile" | grep -E "(rust|lang)" | while read makefile; do
-          if grep -q "rustc" "$makefile"; then
-            # Добавляем флаги для использования системного LLVM
-            sed -i '/CONFIGURE_ARGS/a\\t--enable-llvm-link-shared \\' "$makefile" 2>/dev/null || true
-            sed -i '/CONFIGURE_ARGS/a\\t--llvm-root=/usr/lib/llvm-15 \\' "$makefile" 2>/dev/null || true
-          fi
-        done
-
-        # Подход 5: Создание локального патча для feeds
-        mkdir -p feeds/packages/lang/rust/patches
-        cat > feeds/packages/lang/rust/patches/100-use-system-llvm.patch << 'EOF'
-        --- a/config.example.toml
-        +++ b/config.example.toml
-        @@ -1,6 +1,12 @@
-        +[llvm]
-        +download-ci-llvm = false
-        +link-shared = true
-        +use-libcxx = false
-        +
-         # Sample TOML configuration file for building Rust.
-         #
-         # To configure rustbuild, copy this file to the directory from which you
-        EOF
 
     - name: Prepare dot config and feeds
       run: |
@@ -192,49 +125,19 @@ jobs:
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
 
-    # РЕШЕНИЕ 4: Сборка с расширенным таймаутом и отладкой
-    - name: Compile friendlyWrt with enhanced error handling
+    - name: Compile friendlyWrt
       id: compile
       continue-on-error: true
-      timeout-minutes: 240  # 4 часа для сборки LLVM
       run: |
         cd project/friendlywrt
-        
-        # Установка переменных среды для Rust
-        export RUST_BACKTRACE=1
-        export LLVM_SYS_150_PREFIX=/usr/lib/llvm-15
-        export LIBCLANG_PATH=/usr/lib/llvm-15/lib
-        export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/llvm-15/include"
-        
-        # Попытка компиляции с отладочной информацией
-        echo "Starting compilation with system LLVM..."
-        make -j$(nproc) V=s 2>&1 | tee compile.log || {
-          echo "First attempt failed, trying single-threaded build..."
-          make -j1 V=s 2>&1 | tee -a compile.log
-        }
-        
-        # Проверяем на специфические ошибки Rust/LLVM
-        if grep -q "failed to download llvm from ci" compile.log; then
-          echo "CI LLVM download failed, this should be handled by our config"
-          exit 1
-        fi
-        
-        echo "Build status: $?"
+        make -j$(nproc) || make -j1 V=s
+        echo $?
 
-    # РЕШЕНИЕ 5: Резервная стратегия - исключение Rust из сборки
-    - name: Fallback - Retry without Rust packages
+    - name: Check the result and try again
       if: steps.compile.outcome == 'failure'
       run: |
         cd project/friendlywrt
-        
-        echo "Build failed, trying without Rust-dependent packages..."
-        
-        # Отключаем пакеты, зависящие от Rust
-        sed -i 's/CONFIG_PACKAGE_.*rust.*=y/# CONFIG_PACKAGE_.*rust.*=y/g' .config 2>/dev/null || true
-        make defconfig
-        
-        # Повторная попытка
-        make -j$(nproc) V=s 2>&1 | tee fallback_compile.log || make -j1 V=s 2>&1 | tee -a fallback_compile.log
+        make -j1 V=s
 
     - name: Create rootfs package
       id: create_rootfs_package
@@ -242,115 +145,11 @@ jobs:
         cd project
         source .current_config.mk
         rootfs_filename="rootfs-friendlywrt-${{ matrix.VERSION }}.tgz"
-        
-        # Проверяем какие файлы и директории существуют
-        echo "=== Checking available files and directories ==="
-        echo "Current directory: $(pwd)"
-        echo "FRIENDLYWRT_SRC: ${FRIENDLYWRT_SRC}"
-        echo "FRIENDLYWRT_ROOTFS: ${FRIENDLYWRT_ROOTFS}" 
-        echo "FRIENDLYWRT_PACKAGE_DIR: ${FRIENDLYWRT_PACKAGE_DIR}"
-        
-        # Ищем фактические пути к собранным файлам
-        echo "=== Looking for actual build outputs ==="
-        find . -name "*.rootfs*" -type f 2>/dev/null | head -10
-        find . -name "packages" -type d 2>/dev/null | head -10  
-        find . -path "*/bin/targets/*" -name "*.tar.gz" 2>/dev/null | head -10
-        find . -path "*/bin/targets/*" -name "*.img.gz" 2>/dev/null | head -10
-        
-        # Попытаемся найти правильные пути
-        ACTUAL_ROOTFS=""
-        ACTUAL_PACKAGES=""
-        
-        # Поиск rootfs
-        if [ -n "${FRIENDLYWRT_SRC}" ] && [ -n "${FRIENDLYWRT_ROOTFS}" ]; then
-          if [ -d "${FRIENDLYWRT_SRC}/${FRIENDLYWRT_ROOTFS}" ]; then
-            ACTUAL_ROOTFS="${FRIENDLYWRT_SRC}/${FRIENDLYWRT_ROOTFS}"
-          fi
-        fi
-        
-        # Альтернативный поиск rootfs
-        if [ -z "$ACTUAL_ROOTFS" ]; then
-          ACTUAL_ROOTFS=$(find . -path "*/friendlywrt/bin/targets/*/armv8/*rootfs*" -type f | head -1)
-        fi
-        
-        # Поиск packages
-        if [ -n "${FRIENDLYWRT_SRC}" ] && [ -n "${FRIENDLYWRT_PACKAGE_DIR}" ]; then
-          if [ -d "${FRIENDLYWRT_SRC}/${FRIENDLYWRT_PACKAGE_DIR}" ]; then
-            ACTUAL_PACKAGES="${FRIENDLYWRT_SRC}/${FRIENDLYWRT_PACKAGE_DIR}"
-          fi
-        fi
-        
-        # Альтернативный поиск packages
-        if [ -z "$ACTUAL_PACKAGES" ]; then
-          ACTUAL_PACKAGES=$(find . -path "*/friendlywrt/bin/targets/*/armv8/packages" -type d | head -1)
-        fi
-        
-        echo "=== Found paths ==="
-        echo "ACTUAL_ROOTFS: $ACTUAL_ROOTFS"
-        echo "ACTUAL_PACKAGES: $ACTUAL_PACKAGES"
-        
-        # Создаем архив только из существующих файлов
-        TAR_ARGS=""
-        
-        if [ -n "$ACTUAL_ROOTFS" ] && [ -e "$ACTUAL_ROOTFS" ]; then
-          echo "Adding rootfs to archive: $ACTUAL_ROOTFS"
-          TAR_ARGS="$TAR_ARGS $ACTUAL_ROOTFS"
-        else
-          echo "Warning: No rootfs found, skipping"
-        fi
-        
-        if [ -n "$ACTUAL_PACKAGES" ] && [ -d "$ACTUAL_PACKAGES" ]; then
-          echo "Adding packages to archive: $ACTUAL_PACKAGES"
-          TAR_ARGS="$TAR_ARGS $ACTUAL_PACKAGES"
-        else
-          echo "Warning: No packages directory found, skipping"
-        fi
-        
-        # Также ищем другие полезные файлы
-        KERNEL_FILES=$(find . -path "*/friendlywrt/bin/targets/*/armv8" -name "*kernel*" -type f 2>/dev/null)
-        SYSUPGRADE_FILES=$(find . -path "*/friendlywrt/bin/targets/*/armv8" -name "*sysupgrade*" -type f 2>/dev/null)
-        
-        for file in $KERNEL_FILES $SYSUPGRADE_FILES; do
-          if [ -f "$file" ]; then
-            echo "Adding additional file: $file"
-            TAR_ARGS="$TAR_ARGS $file"
-          fi
-        done
-        
-        # Создаем архив
-        if [ -n "$TAR_ARGS" ]; then
-          echo "=== Creating archive with files: $TAR_ARGS ==="
-          tar czf ../artifact/${rootfs_filename} $TAR_ARGS
-          
-          # Проверяем размер созданного архива
-          if [ -f "../artifact/${rootfs_filename}" ]; then
-            archive_size=$(stat -f%z "../artifact/${rootfs_filename}" 2>/dev/null || stat -c%s "../artifact/${rootfs_filename}" 2>/dev/null)
-            echo "Archive created successfully, size: $archive_size bytes"
-          else
-            echo "Error: Archive was not created"
-            exit 1
-          fi
-        else
-          echo "Error: No files found to archive"
-          echo "=== Full directory listing for debugging ==="
-          find . -path "*/friendlywrt/bin*" -type f | head -20
-          exit 1
-        fi
-        
+        tar cvzf ../artifact/${rootfs_filename} ${FRIENDLYWRT_SRC}/${FRIENDLYWRT_ROOTFS} \
+              ${FRIENDLYWRT_SRC}/${FRIENDLYWRT_PACKAGE_DIR}
         echo "rootfs_filename=$rootfs_filename" >> $GITHUB_OUTPUT
 
-    - name: Upload build logs (for debugging)
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: build-logs
-        path: |
-          project/friendlywrt/compile.log
-          project/friendlywrt/fallback_compile.log
-        retention-days: 7
-
     - name: Upload rootfs package
-      if: steps.create_rootfs_package.outcome == 'success'
       uses: svenstaro/upload-release-action@v2
       with:
         repo_token: ${{ secrets.GITHUB_TOKEN }}
@@ -359,23 +158,133 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-    # Дополнительная загрузка отдельных файлов если архив не удался
-    - name: Upload individual build artifacts (fallback)
-      if: steps.create_rootfs_package.outcome == 'failure'
+  build_img:
+    needs: [prepare_release,build_friendlywrt]
+    runs-on: ubuntu-22.04
+    if: github.event.repository.owner.id == github.event.sender.id
+
+    strategy:
+      matrix:
+        VERSION: ['23.05', '24.10']
+        CPU: [rk3328]  # Только rk3328 для R2S-R2C-Series
+        SET: [non-docker]  # Только non-docker
+        
+    steps:
+    - name: Checkout
+      uses: actions/checkout@main
+
+    - name: Cache kernel and uboot
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cache/repo
+          project/kernel
+          project/u-boot
+          project/rkbin
+          project/toolchain
+        key: friendlywrt-kernel-${{ matrix.CPU }}-${{ matrix.VERSION }}-${{ hashFiles('**/Makefile', '**/*.mk') }}
+        restore-keys: |
+          friendlywrt-kernel-${{ matrix.CPU }}-${{ matrix.VERSION }}-
+          friendlywrt-kernel-${{ matrix.CPU }}-
+          friendlywrt-kernel-
+
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo rm -rf /etc/apt/sources.list.d
+        wget https://raw.githubusercontent.com/friendlyarm/build-env-on-ubuntu-bionic/master/install.sh
+        sed -i -e 's/^apt-get -y install openjdk-8-jdk/# apt-get -y install openjdk-8-jdk/g' install.sh
+        sed -i -e 's/^\[ -d fa-toolchain \]/# [ -d fa-toolchain ]/g' install.sh
+        sed -i -e 's/^(cat fa-toolchain/# (cat fa-toolchain/g' install.sh
+        sed -i -e 's/^(tar xf fa-toolchain/# (tar xf fa-toolchain/g' install.sh
+        sudo -E bash ./install.sh
+        sudo -E git config --global user.name 'GitHub Actions'
+        sudo -E git config --global user.email 'noreply@github.com'
+        git clone https://github.com/friendlyarm/repo
+        sudo -E cp repo/repo /usr/bin/
+        mkdir -p ./artifact
+        sudo swapoff -a
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk /usr/local/share/boost /opt/ghc
+        echo "cores: $(nproc)"
+
+    - name: Download source
+      run: |
+        mkdir -p project
+        cd project
+        repo init --depth=1 -u https://github.com/friendlyarm/friendlywrt_manifests -b master-v${{ matrix.VERSION }} \
+                -m ${{ matrix.CPU }}.xml --repo-url=https://github.com/friendlyarm/repo  --no-clone-bundle
+
+        repo sync -c kernel --no-clone-bundle
+        repo sync -c u-boot --no-clone-bundle
+        repo sync -c rkbin --no-clone-bundle
+        repo sync -c configs --no-clone-bundle
+        repo sync -c device/common --no-clone-bundle
+        repo sync -c device/friendlyelec --no-clone-bundle
+        repo sync -c scripts --no-clone-bundle
+        repo sync -c scripts/sd-fuse  --no-clone-bundle
+        repo sync -c toolchain  --no-clone-bundle
+
+    - name: Download friendlywrt rootfs
+      uses: robinraju/release-downloader@v1.6
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        repository: ${{ github.repository }}
+        tag: ${{ needs.prepare_release.outputs.release_tag }}
+        fileName: "rootfs-friendlywrt-${{ matrix.VERSION }}.tgz"
+
+    - name: Prepare config
+      id: config
       run: |
         cd project
-        echo "=== Uploading individual files as fallback ==="
-        
-        # Ищем все созданные файлы образов
-        find . -path "*/friendlywrt/bin/targets/*/armv8" -type f \( -name "*.img.gz" -o -name "*.tar.gz" -o -name "*sysupgrade*" \) | while read file; do
-          if [ -f "$file" ]; then
-            filename=$(basename "$file")
-            echo "Found build artifact: $filename"
-            cp "$file" "../artifact/"
-            
-            # Загружаем каждый файл отдельно
-            gh release upload "${{ needs.prepare_release.outputs.release_tag }}" "../artifact/$filename" --clobber || echo "Failed to upload $filename"
-          fi
-        done
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        MODEL=R2S-R2C-Series
+        FILENAME=${MODEL}-FriendlyWrt-${{ matrix.VERSION }}.img
+        DIRNAME=friendlywrt$(echo ${{ matrix.VERSION }}|awk -F . '{print $1}')
+        CONFIG=rockchip
+        cat > .current_config.mk <<EOL
+        . device/friendlyelec/${{ matrix.CPU }}/base.mk
+        TARGET_IMAGE_DIRNAME=${DIRNAME}
+        TARGET_FRIENDLYWRT_CONFIG=${CONFIG}
+        TARGET_SD_RAW_FILENAME=${FILENAME}
+        EOL
+        echo "img_filename=$FILENAME" >> $GITHUB_OUTPUT
+
+    - name: Unpack friendlywrt rootfs
+      run: |
+        cd project
+        tar xvzf "../rootfs-friendlywrt-${{ matrix.VERSION }}.tgz"
+
+    - name: Compile uboot and kernel
+      run: |
+        cd project
+        ## If you need to modify the kernel configuration, please edit the script below
+        # source ../scripts/custome_kernel_config.sh
+
+        ./build.sh uboot
+        ./build.sh kernel
+
+        ## If you want to compile a driver from source, here is an example
+        # case ${{ matrix.CPU }} in
+        # rk3568)
+        #     ../scripts/3rd/add_r8125.sh
+        #     ;;
+        # esac
+
+    - name: Build sd image
+      id: build_sd_image
+      run: |
+        cd project
+        ./build.sh sd-img
+        mv out/${{ steps.config.outputs.img_filename }} ../artifact/
+        cd ../artifact/
+        gzip *.img
+
+    - name: Upload image to release
+      uses: svenstaro/upload-release-action@v2
+      with:
+        repo_token: ${{ secrets.GITHUB_TOKEN }}
+        file: ./artifact/${{ steps.config.outputs.img_filename }}.gz
+        asset_name: ${{ steps.config.outputs.img_filename }}.gz
+        tag: ${{ needs.prepare_release.outputs.release_tag }}
+        overwrite: true
